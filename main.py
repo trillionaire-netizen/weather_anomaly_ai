@@ -5,11 +5,18 @@ from sklearn.ensemble import IsolationForest
 import requests
 from datetime import datetime
 
-app = FastAPI(title="AWS Weather Anomaly Detection API", version="1.7")
+app = FastAPI(title="AWS Weather Anomaly Detection API", version="2.0")
 
-def fetch_aws_telemetry(simulate_fault: bool = False, use_msl: bool = False):
-    # Request both surface pressure and mean sea level pressure (MSLP)
-    url = "https://api.open-meteo.com/v1/forecast?latitude=21.2514&longitude=81.6296&hourly=temperature_2m,relative_humidity_2m,surface_pressure,pressure_msl,wind_speed_10m,precipitation"
+# Station coordinates mapping including Southern Europe (Madrid)
+LOCATIONS = {
+    "raipur": {"lat": 21.2190, "lon": 81.6350, "name": "Tikrapara, Raipur, CG"},
+    "europe": {"lat": 40.4169, "lon": -3.7034, "name": "Madrid, Spain (Mediterranean Heat Dome)"}
+}
+
+def fetch_aws_telemetry(city: str = "raipur", simulate_fault: bool = False, use_msl: bool = False):
+    loc = LOCATIONS.get(city, LOCATIONS["raipur"])
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={loc['lat']}&longitude={loc['lon']}&hourly=temperature_2m,relative_humidity_2m,surface_pressure,pressure_msl,wind_speed_10m,precipitation"
+    
     response = requests.get(url).json()
     hourly = response.get("hourly", {})
     
@@ -24,25 +31,30 @@ def fetch_aws_telemetry(simulate_fault: bool = False, use_msl: bool = False):
     })
     df = df.dropna()
     
-    # Filter out future forecasts
+    # Filter out future forecasts safely
     df["time"] = pd.to_datetime(df["time"])
     current_time = pd.Timestamp.now()
-    df = df[df["time"] <= current_time]
+    filtered_df = df[df["time"] <= current_time]
     
-    # Choose active pressure metric based on user toggle
-    df["pressure"] = df["pressure_msl"] if use_msl else df["surface_pressure"]
+    # --- SAFETY FALLBACK ---
+    # If the time filter accidentally leaves 0 rows, use the full dataset
+    if len(filtered_df) > 0:
+        df = filtered_df
     
-    # Conditionally inject anomaly on the latest record if toggled
+    # Choose active pressure metric
+    df["pressure"] = df["pressure_msl" if use_msl else "surface_pressure"]
+    
+    # Inject anomaly if toggled
     if simulate_fault and not df.empty:
         df.iloc[-1, df.columns.get_loc("pressure")] = 800.0      
         df.iloc[-1, df.columns.get_loc("precipitation")] = 150.0  
         df.iloc[-1, df.columns.get_loc("wind_speed")] = 140.0    
         
-    return df
+    return df, loc["name"]
 
 @app.get("/api/analyze-station")
-def analyze_station(simulate_fault: bool = False, use_msl: bool = False):
-    df = fetch_aws_telemetry(simulate_fault=simulate_fault, use_msl=use_msl)
+def analyze_station(city: str = "raipur", simulate_fault: bool = False, use_msl: bool = False):
+    df, location_name = fetch_aws_telemetry(city=city, simulate_fault=simulate_fault, use_msl=use_msl)
     
     df["temp_lag1"] = df["temperature"].shift(1)
     df["temp_rolling_mean"] = df["temperature"].rolling(window=3).mean()
@@ -77,9 +89,9 @@ def analyze_station(simulate_fault: bool = False, use_msl: bool = False):
 
     return {
         "status": "success",
-        "station_id": "AWS-RAIPUR-CG-01",
-        "location": "Raipur, Chhattisgarh",
-        "pressure_mode": "Mean Sea Level (MSLP ~1007hPa)" if use_msl else "Raw Surface Pressure (~971hPa)",
+        "station_id": f"AWS-{city.upper()}-01",
+        "location": location_name,
+        "pressure_mode": "Mean Sea Level (MSLP)" if use_msl else "Raw Surface Pressure",
         "mode": "SIMULATED FAULT ACTIVE" if simulate_fault else "LIVE TELEMETRY NORMAL",
         "total_readings_processed": len(df),
         "total_anomalies_flagged": len(anomalies_df),
